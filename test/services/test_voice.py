@@ -1,5 +1,7 @@
 import asyncio
 import base64
+import os
+import shutil
 import unittest
 import sys
 import tempfile
@@ -36,6 +38,11 @@ text_zh = """
 
 voice_rate=1.0
 voice_volume=1.0
+RUN_INTEGRATION_TESTS = os.environ.get("MPT_RUN_INTEGRATION_TESTS", "").lower() in {
+    "1",
+    "true",
+    "yes",
+}
                     
 class TestVoiceService(unittest.TestCase):
     def setUp(self):
@@ -61,6 +68,120 @@ class TestVoiceService(unittest.TestCase):
             all(v.startswith(("zh-CN", "en-US")) for v in filtered)
         )
 
+    def test_no_voice_tts_generates_silent_audio_and_subtitle_timeline(self):
+        """
+        无配音模式不调用任何外部 TTS provider，只生成静音音频作为时间轴占位。
+        这里 mock FFmpeg，验证请求参数、输出文件和 legacy 字幕结构都符合后续
+        视频合成链路的预期。
+        """
+
+        def fake_run(command, capture_output, text, check):
+            self.assertEqual(command[0], "/tmp/fake-ffmpeg")
+            self.assertIn("anullsrc=r=44100:cl=mono", command)
+            Path(command[-1]).write_bytes(b"fake-silent-mp3")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            vs.utils,
+            "get_ffmpeg_binary",
+            return_value="/tmp/fake-ffmpeg",
+        ), patch.object(vs.subprocess, "run", side_effect=fake_run):
+            voice_file = str(Path(tmp_dir) / "silent.mp3")
+            sub_maker = vs.tts(
+                text="第一句话。Second sentence.",
+                voice_name=vs.NO_VOICE_NAME,
+                voice_rate=1.0,
+                voice_file=voice_file,
+            )
+
+            self.assertEqual(Path(voice_file).read_bytes(), b"fake-silent-mp3")
+
+        self.assertIsNotNone(sub_maker)
+        self.assertEqual(getattr(sub_maker, "subs", []), ["第一句话", "Second sentence"])
+        self.assertEqual(len(getattr(sub_maker, "offset", [])), 2)
+        self.assertGreater(vs.get_audio_duration(sub_maker), 0)
+
+    def test_get_audio_duration_accepts_non_mp3_files(self):
+        """
+        自定义音频（custom_audio_file）常见为 m4a/wav/aac 等非 mp3 格式。
+        get_audio_duration 不应因扩展名不是 .mp3 就报 "Invalid target type" 并返回 0，
+        而应交给 moviepy(ffmpeg) 读取真实时长。
+        """
+        for path in ("custom-audio.m4a", "voice.wav", "clip.aac"):
+            with patch.object(vs.os.path, "exists", return_value=True), \
+                    patch.object(vs, "AudioFileClip") as mock_afc:
+                mock_afc.return_value.__enter__.return_value.duration = 28.89
+                self.assertEqual(vs.get_audio_duration(path), 28.89)
+                mock_afc.assert_called_once_with(path)
+
+    def test_get_audio_duration_missing_file_returns_zero(self):
+        """音频文件不存在时安全返回 0，而不是抛异常或读取失败。"""
+        with patch.object(vs.os.path, "exists", return_value=False):
+            self.assertEqual(vs.get_audio_duration("does-not-exist.m4a"), 0.0)
+
+    def test_no_voice_alias_none_is_supported_temporarily(self):
+        """
+        兼容 PR #981 曾使用过的 none sentinel，避免少量直接调用 API 的用户
+        升级后立即失效。新 UI 和新代码仍统一使用 no-voice。
+        """
+        self.assertTrue(vs.is_no_voice("none"))
+        self.assertTrue(vs.is_no_voice(vs.NO_VOICE_NAME))
+        self.assertFalse(vs.is_no_voice(""))
+
+    def test_no_voice_duration_estimates_non_ascii_languages(self):
+        """
+        无配音没有真实 TTS 音频，只能根据脚本文字估算阅读时间。俄语、阿拉伯语、
+        日文假名、韩文等非 ASCII 文本也必须参与估算，不能都落到最短 3 秒。
+        """
+        russian_text = (
+            "Это длинный тестовый сценарий без озвучки. "
+            "Он должен получить достаточно времени для чтения субтитров."
+        )
+        arabic_text = "هذا اختبار طويل بدون تعليق صوتي، ويجب أن يحصل على وقت كاف لقراءة الترجمة."
+
+        self.assertGreater(vs.estimate_no_voice_duration(russian_text), 8.0)
+        self.assertGreater(vs.estimate_no_voice_duration(arabic_text), 8.0)
+
+    def test_generate_silent_audio_rejects_missing_output_file(self):
+        """
+        即使 FFmpeg 进程返回成功，也要确认输出文件真实存在且非空。这样可以把
+        异常收敛在 TTS 阶段，而不是拖到后续视频合成阶段才暴露。
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            vs.utils,
+            "get_ffmpeg_binary",
+            return_value="/tmp/fake-ffmpeg",
+        ), patch.object(
+            vs.subprocess,
+            "run",
+            return_value=SimpleNamespace(returncode=0, stdout="", stderr=""),
+        ):
+            voice_file = str(Path(tmp_dir) / "missing-silent.mp3")
+
+            self.assertFalse(vs.generate_silent_audio(3.0, voice_file))
+
+    def test_empty_voice_name_does_not_enable_no_voice_mode(self):
+        """
+        空 voice 通常意味着配置缺失或接口参数错误，不能自动切到无配音模式。
+        否则用户填错 TTS 配置时也会得到一个“成功”的静音视频，定位成本更高。
+        """
+        sentinel = object()
+
+        with patch.object(vs, "azure_tts_v1", return_value=sentinel) as azure_tts_v1:
+            result = vs.tts(
+                text="empty voice should still use the default TTS path",
+                voice_name="",
+                voice_rate=1.0,
+                voice_file="/tmp/empty-voice.mp3",
+            )
+
+        self.assertIs(result, sentinel)
+        azure_tts_v1.assert_called_once()
+
+    @unittest.skipUnless(
+        RUN_INTEGRATION_TESTS,
+        "MPT_RUN_INTEGRATION_TESTS not set",
+    )
     def test_siliconflow(self):
         # SiliconFlow 的 API Key 存在 [siliconflow].api_key 中，运行时代码也是从
         # config.siliconflow 读取；这里必须使用同一配置源，避免正确配置凭据时
@@ -95,6 +216,10 @@ class TestVoiceService(unittest.TestCase):
 
         self.loop.run_until_complete(_do())
     
+    @unittest.skipUnless(
+        RUN_INTEGRATION_TESTS,
+        "MPT_RUN_INTEGRATION_TESTS not set",
+    )
     def test_azure_tts_v1(self):
         voice_name = "zh-CN-XiaoyiNeural-Female"
         voice_name = vs.parse_voice_name(voice_name)
@@ -213,6 +338,10 @@ class TestVoiceService(unittest.TestCase):
         self.assertIsNone(sub_maker)
         self.assertLess(elapsed, 2)
 
+    @unittest.skipUnless(
+        RUN_INTEGRATION_TESTS,
+        "MPT_RUN_INTEGRATION_TESTS not set",
+    )
     def test_azure_tts_v2(self):
         if not vs.config.azure.get("speech_key") or not vs.config.azure.get("speech_region"):
             self.skipTest("Azure speech key or region is not configured")
@@ -225,7 +354,10 @@ class TestVoiceService(unittest.TestCase):
             voice_file = f"{temp_dir}/tts-azure-v2-{voice_name}.mp3"
             subtitle_file = f"{temp_dir}/tts-azure-v2-{voice_name}.srt"
             sub_maker = vs.azure_tts_v2(
-                text=text_zh, voice_name=voice_name, voice_file=voice_file
+                text=text_zh,
+                voice_name=voice_name,
+                voice_file=voice_file,
+                voice_rate=1.0,
             )
             if not sub_maker:
                 self.fail("azure tts v2 failed")
@@ -235,11 +367,43 @@ class TestVoiceService(unittest.TestCase):
 
         self.loop.run_until_complete(_do())
 
-    def test_gemini_tts_uses_legacy_submaker_fields(self):
+    def test_azure_tts_v2_ssml_applies_rate_and_escapes_text(self):
+        """Azure V2 必须通过 SSML 应用语速，并避免用户文案破坏 XML。"""
+        ssml = vs._build_azure_v2_ssml(
+            text='A < B & "quoted"',
+            voice_name="zh-CN-XiaoxiaoMultilingualNeural",
+            voice_rate=1.8,
+        )
+
+        self.assertIn('xml:lang="zh-CN"', ssml)
+        self.assertIn('rate="1.8"', ssml)
+        self.assertIn("A &lt; B &amp; \"quoted\"", ssml)
+
+    def test_tts_forwards_rate_to_azure_v2(self):
+        """统一 TTS 入口不能在分发 Azure V2 时丢失 voice_rate。"""
+        voice_name = "zh-CN-XiaoxiaoMultilingualNeural-V2-Female"
+        with patch.object(vs, "azure_tts_v2", return_value=object()) as mock_tts:
+            result = vs.tts(
+                text="语速测试",
+                voice_name=voice_name,
+                voice_rate=1.8,
+                voice_file="/tmp/azure-v2-rate.mp3",
+            )
+
+        self.assertIsNotNone(result)
+        mock_tts.assert_called_once_with(
+            "语速测试",
+            voice_name,
+            "/tmp/azure-v2-rate.mp3",
+            voice_rate=1.8,
+        )
+
+    def test_gemini_tts_uses_google_genai_and_compatible_submaker_fields(self):
         """
         验证 Gemini TTS 在 edge_tts 7.x 环境下仍会返回项目兼容的字幕结构，
         并且可以被 `subtitle_provider=edge` 的字幕生成链路直接消费，
-        避免再次回退 Whisper。
+        避免再次回退 Whisper。同时使用不存在的嵌套输出目录，覆盖 API 或
+        CLI 直接调用服务时没有提前创建任务目录的边界情况。
         """
 
         class _InlineData:
@@ -262,11 +426,11 @@ class TestVoiceService(unittest.TestCase):
             def __init__(self, data):
                 self.candidates = [_Candidate(data)]
 
-        class _FakeModel:
-            def __init__(self, name):
-                self.name = name
+        captured = {}
 
-            def generate_content(self, contents, generation_config):
+        class _FakeModels:
+            def generate_content(self, **kwargs):
+                captured.update(kwargs)
                 tone = (
                     AudioSegment.silent(duration=1800)
                     .set_frame_rate(24000)
@@ -275,13 +439,31 @@ class TestVoiceService(unittest.TestCase):
                 )
                 return _Response(tone.raw_data)
 
-        voice_file = f"{temp_dir}/tts-gemini-Zephyr.mp3"
-        subtitle_file = f"{temp_dir}/tts-gemini-Zephyr.srt"
+        class _FakeClient:
+            def __init__(self, **kwargs):
+                captured["client_kwargs"] = kwargs
+                self.models = _FakeModels()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                captured["closed"] = True
+
+        temp_root = Path(tempfile.mkdtemp(prefix="gemini-tts-output-"))
+        self.addCleanup(shutil.rmtree, temp_root, True)
+        output_dir = temp_root / "nested" / "audio"
+        voice_file = str(output_dir / "tts-gemini-Zephyr.mp3")
+        subtitle_file = str(output_dir / "tts-gemini-Zephyr.srt")
         text = "Gemini subtitle generation should work now. Testing multiple lines."
 
-        with patch("google.generativeai.configure"), patch(
-            "google.generativeai.GenerativeModel", _FakeModel
-        ), patch.object(vs.config, "app", dict(vs.config.app, gemini_api_key="test-key")):
+        self.assertFalse(output_dir.exists())
+
+        with patch("google.genai.Client", _FakeClient), patch.object(
+            vs.config,
+            "app",
+            dict(vs.config.app, gemini_api_key="test-key"),
+        ):
             sub_maker = vs.gemini_tts(
                 text=text,
                 voice_name="Zephyr",
@@ -290,6 +472,7 @@ class TestVoiceService(unittest.TestCase):
             )
 
         self.assertIsNotNone(sub_maker)
+        self.assertTrue(Path(voice_file).is_file())
         self.assertEqual(
             getattr(sub_maker, "subs", []),
             ["Gemini subtitle generation should work now", "Testing multiple lines"],
@@ -297,6 +480,16 @@ class TestVoiceService(unittest.TestCase):
         self.assertEqual(len(getattr(sub_maker, "offset", [])), 2)
         self.assertEqual(sub_maker.offset[0][0], 0)
         self.assertLess(sub_maker.offset[0][1], sub_maker.offset[1][1])
+        self.assertEqual(captured["client_kwargs"], {"api_key": "test-key"})
+        self.assertEqual(captured["model"], "gemini-2.5-flash-preview-tts")
+        self.assertEqual(captured["contents"], text)
+        self.assertEqual(captured["config"].response_modalities, ["AUDIO"])
+        voice_config = captured["config"].speech_config.voice_config
+        self.assertEqual(
+            voice_config.prebuilt_voice_config.voice_name,
+            "Zephyr",
+        )
+        self.assertTrue(captured["closed"])
 
         vs.create_subtitle(sub_maker=sub_maker, text=text, subtitle_file=subtitle_file)
         subtitle_content = Path(subtitle_file).read_text(encoding="utf-8")
@@ -393,6 +586,127 @@ class TestVoiceService(unittest.TestCase):
         self.assertIsNotNone(sub_maker)
         self.assertEqual(getattr(sub_maker, "subs", []), ["小米语音合成测试", "第二句话"])
         self.assertEqual(len(getattr(sub_maker, "offset", [])), 2)
+
+    def test_chatterbox_voice_helpers(self):
+        """is_chatterbox_voice / get_chatterbox_voices basics and normalisation."""
+        self.assertTrue(vs.is_chatterbox_voice("chatterbox:default-Female"))
+        self.assertFalse(vs.is_chatterbox_voice("elevenlabs:abc:Rachel"))
+        self.assertFalse(vs.is_chatterbox_voice(""))
+        self.assertFalse(vs.is_chatterbox_voice(None))
+
+        # list entries are normalised to the chatterbox:<name> dispatcher format,
+        # and entries that are already prefixed are left untouched
+        with patch.object(
+            vs.config,
+            "chatterbox",
+            {"voices": ["narrator-Male", "chatterbox:host"]},
+        ):
+            self.assertEqual(
+                vs.get_chatterbox_voices(),
+                ["chatterbox:narrator-Male", "chatterbox:host"],
+            )
+
+        # a comma-separated string is also accepted (TOML-friendly)
+        with patch.object(vs.config, "chatterbox", {"voices": "alpha, beta ,"}):
+            self.assertEqual(
+                vs.get_chatterbox_voices(),
+                ["chatterbox:alpha", "chatterbox:beta"],
+            )
+
+        # with nothing configured the dropdown still gets a usable default
+        with patch.object(vs.config, "chatterbox", {}):
+            self.assertEqual(vs.get_chatterbox_voices(), ["chatterbox:default-Female"])
+
+    def test_chatterbox_tts_posts_to_openai_compatible_endpoint(self):
+        """Success path: POST /audio/speech, write audio, return legacy SubMaker."""
+
+        class _FakeResponse:
+            status_code = 200
+            content = b"RIFF-fake-wav"
+            text = ""
+
+        class _FakeClip:
+            duration = 3.5
+
+            def close(self):
+                pass
+
+        captured = {}
+
+        def _fake_post(url, json=None, headers=None, timeout=None):
+            captured["url"] = url
+            captured["json"] = json
+            captured["headers"] = headers
+            return _FakeResponse()
+
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            vs.config,
+            "chatterbox",
+            {
+                "base_url": "http://localhost:4123/v1/",
+                "api_key": "secret",
+                "model_id": "chatterbox",
+            },
+        ), patch.object(
+            vs.requests, "post", side_effect=_fake_post
+        ) as post, patch.object(
+            vs, "AudioFileClip", return_value=_FakeClip()
+        ):
+            voice_file = str(Path(tmp_dir) / "chatterbox.mp3")
+            sub_maker = vs.chatterbox_tts(
+                text="Hello world. Second sentence.",
+                voice="default",
+                voice_file=voice_file,
+                voice_rate=1.2,
+                voice_volume=1.0,
+            )
+            generated_audio = Path(voice_file).read_bytes()
+
+        post.assert_called_once()
+        # trailing slash on base_url is stripped before appending /audio/speech
+        self.assertEqual(captured["url"], "http://localhost:4123/v1/audio/speech")
+        self.assertEqual(captured["json"]["model"], "chatterbox")
+        self.assertEqual(captured["json"]["voice"], "default")
+        self.assertEqual(captured["json"]["input"], "Hello world. Second sentence.")
+        self.assertAlmostEqual(captured["json"]["speed"], 1.2)
+        # api_key is forwarded as a bearer token
+        self.assertEqual(captured["headers"].get("Authorization"), "Bearer secret")
+        # volume is intentionally not part of the OpenAI speech payload
+        self.assertNotIn("volume", captured["json"])
+        self.assertEqual(generated_audio, b"RIFF-fake-wav")
+        self.assertIsNotNone(sub_maker)
+        self.assertTrue(getattr(sub_maker, "subs", []))
+
+    def test_chatterbox_tts_requires_base_url(self):
+        """Missing base_url short-circuits without any network call."""
+        with patch.object(
+            vs.config, "chatterbox", {"base_url": ""}
+        ), patch.object(vs.requests, "post") as post:
+            result = vs.chatterbox_tts(
+                text="hi", voice="default", voice_file="unused.mp3"
+            )
+        self.assertIsNone(result)
+        post.assert_not_called()
+
+    def test_chatterbox_tts_returns_none_on_http_error(self):
+        """A non-200 response is retried up to 3 times, then fails to None."""
+
+        class _FakeResponse:
+            status_code = 500
+            content = b""
+            text = "boom"
+
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            vs.config, "chatterbox", {"base_url": "http://localhost:4123/v1"}
+        ), patch.object(
+            vs.requests, "post", return_value=_FakeResponse()
+        ) as post:
+            voice_file = str(Path(tmp_dir) / "chatterbox.mp3")
+            result = vs.chatterbox_tts(
+                text="hi", voice="default", voice_file=voice_file
+            )
+        self.assertIsNone(result)
+        self.assertEqual(post.call_count, 3)
 
     def test_generate_subtitle_keeps_edge_provider_for_gemini_legacy_submaker(self):
         """
@@ -622,6 +936,102 @@ class TestVoiceService(unittest.TestCase):
         self.assertEqual(vs.convert_rate_to_percent(0.997), "+0%")
         self.assertEqual(vs.convert_rate_to_percent(1.5), "+50%")
         self.assertEqual(vs.convert_rate_to_percent(0.8), "-20%")
+
+    def test_convert_rate_to_percent_invalid_values_default_to_normal(self):
+        # API 和批处理脚本可能把空语速传成 0、None 或空字符串；这些都不应让
+        # edge-tts 收到 -100% 或触发异常，而是按正常语速处理。
+        self.assertEqual(vs.convert_rate_to_percent(0), "+0%")
+        self.assertEqual(vs.convert_rate_to_percent(0.0), "+0%")
+        self.assertEqual(vs.convert_rate_to_percent(None), "+0%")
+        self.assertEqual(vs.convert_rate_to_percent(""), "+0%")
+
+
+class TestElevenLabsVoice(unittest.TestCase):
+
+    def test_is_elevenlabs_voice_true(self):
+        self.assertTrue(vs.is_elevenlabs_voice("elevenlabs:pNInz6obpgDQGcFmaJgB:Adam"))
+
+    def test_is_elevenlabs_voice_false_azure(self):
+        self.assertFalse(vs.is_elevenlabs_voice("zh-CN-XiaoxiaoNeural-Female"))
+
+    def test_is_elevenlabs_voice_false_siliconflow(self):
+        self.assertFalse(vs.is_elevenlabs_voice("siliconflow:model:voice-Male"))
+
+    def test_is_elevenlabs_voice_empty(self):
+        self.assertFalse(vs.is_elevenlabs_voice(""))
+
+    def test_is_elevenlabs_voice_none(self):
+        self.assertFalse(vs.is_elevenlabs_voice(None))
+
+    def test_get_elevenlabs_voices_empty_api_key(self):
+        result = vs.get_elevenlabs_voices("")
+        self.assertEqual(result, [])
+
+    @patch("app.services.voice.requests.get")
+    def test_get_elevenlabs_voices_success(self, mock_get):
+        mock_get.return_value.status_code = 200
+        mock_get.return_value.json.return_value = {
+            "voices": [
+                {"voice_id": "abc123", "name": "Adam"},
+                {"voice_id": "def456", "name": "Rachel"},
+            ]
+        }
+        result = vs.get_elevenlabs_voices("fake-api-key")
+        self.assertEqual(result, [
+            "elevenlabs:abc123:Adam",
+            "elevenlabs:def456:Rachel",
+        ])
+        mock_get.assert_called_once()
+        call_kwargs = mock_get.call_args
+        self.assertIn("xi-api-key", call_kwargs.kwargs.get("headers", {}))
+
+    @patch("app.services.voice.requests.get")
+    def test_get_elevenlabs_voices_http_error(self, mock_get):
+        mock_get.return_value.status_code = 401
+        mock_get.return_value.text = "Unauthorized"
+        result = vs.get_elevenlabs_voices("bad-key")
+        self.assertEqual(result, [])
+
+    @patch("app.services.voice.requests.get")
+    def test_get_elevenlabs_voices_network_error(self, mock_get):
+        import requests as req_lib
+        mock_get.side_effect = req_lib.exceptions.ConnectionError("timeout")
+        result = vs.get_elevenlabs_voices("fake-key")
+        self.assertEqual(result, [])
+
+    @patch("app.services.voice.requests.post")
+    @patch("app.services.voice.AudioFileClip")
+    @patch("app.services.voice.config")
+    def test_elevenlabs_tts_success(self, mock_config, mock_clip_cls, mock_post):
+        mock_config.elevenlabs.get.return_value = "fake-api-key"
+        mock_post.return_value.status_code = 200
+        mock_post.return_value.content = b"fake-mp3-bytes"
+        mock_clip_cls.return_value.duration = 3.0
+        mock_clip_cls.return_value.close = lambda: None
+
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            out_path = f.name
+
+        try:
+            result = vs.elevenlabs_tts("Hello world", "abc123", out_path)
+            self.assertIsNotNone(result)
+            self.assertTrue(hasattr(result, "subs"))
+            self.assertTrue(hasattr(result, "offset"))
+        finally:
+            if os.path.exists(out_path):
+                os.remove(out_path)
+
+    @patch("app.services.voice.config")
+    def test_elevenlabs_tts_no_api_key(self, mock_config):
+        mock_config.elevenlabs.get.return_value = ""
+        result = vs.elevenlabs_tts("Hello", "abc123", "/tmp/test.mp3")
+        self.assertIsNone(result)
+
+    @patch("app.services.voice.config")
+    def test_elevenlabs_tts_empty_text(self, mock_config):
+        mock_config.elevenlabs.get.return_value = "fake-key"
+        result = vs.elevenlabs_tts("  ", "abc123", "/tmp/test.mp3")
+        self.assertIsNone(result)
 
 
 if __name__ == "__main__":
