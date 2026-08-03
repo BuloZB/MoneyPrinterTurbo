@@ -1,3 +1,4 @@
+import errno
 import threading
 import tomllib
 from pathlib import Path
@@ -5,7 +6,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from app.config import config
-from app.models.llm_provider import LLM_PROVIDER_REGISTRY
+from app.models.llm_provider import LLM_PROVIDER_REGISTRY, get_llm_provider
 
 
 class TestConfigPersistence:
@@ -39,6 +40,13 @@ class TestConfigPersistence:
                 assert provider.config_key("model_name") in app_config
             for field in provider.extra_fields:
                 assert provider.config_key(field.config_suffix) in app_config
+
+    def test_kimi_uses_current_default_model(self):
+        """Kimi 未配置模型覆盖值时，应使用当前发布版本的默认模型。"""
+        provider = get_llm_provider("moonshot")
+
+        assert provider is not None
+        assert provider.resolve_model_name("") == "kimi-k3"
 
     def test_upload_post_settings_belong_to_app_section(self):
         """发布配置必须位于 app 节点，确保示例文件与运行时读取路径一致。"""
@@ -75,6 +83,79 @@ class TestConfigPersistence:
 
                 saved_config = tomllib.loads(config_path.read_text(encoding="utf-8"))
                 assert saved_config["app"]["atomic_save_test"] == "ok"
+                assert list(Path(temp_dir).glob(".config-*.toml.tmp")) == []
+        finally:
+            config.app.clear()
+            config.app.update(original_app)
+            config._cfg.clear()
+            config._cfg.update(original_cfg)
+
+    def test_save_config_falls_back_for_bind_mounted_file(self):
+        """
+        Docker Desktop 的单文件挂载点不能被 os.replace 替换。遇到 EBUSY 时
+        应在锁内原地覆盖，并确保最终内容完整、可解析且不遗留临时文件。
+        """
+        original_cfg = dict(config._cfg)
+        original_app = dict(config.app)
+        try:
+            with TemporaryDirectory() as temp_dir:
+                config_path = Path(temp_dir) / "config.toml"
+                config_path.write_text("[app]\nold_value = true\n", encoding="utf-8")
+                config.app["bind_mount_save_test"] = "ok"
+
+                with (
+                    patch.object(config, "root_dir", temp_dir),
+                    patch.object(config, "config_file", str(config_path)),
+                    patch.object(
+                        config.os,
+                        "replace",
+                        side_effect=OSError(
+                            errno.EBUSY,
+                            "Device or resource busy",
+                        ),
+                    ),
+                    patch.object(config.logger, "warning") as warning_mock,
+                ):
+                    config.save_config()
+
+                saved_config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+                assert saved_config["app"]["bind_mount_save_test"] == "ok"
+                assert list(Path(temp_dir).glob(".config-*.toml.tmp")) == []
+                warning_mock.assert_called_once()
+        finally:
+            config.app.clear()
+            config.app.update(original_app)
+            config._cfg.clear()
+            config._cfg.update(original_cfg)
+
+    def test_save_config_does_not_hide_other_replace_errors(self):
+        """非 EBUSY 错误必须继续抛出，不能把权限或磁盘故障伪装成保存成功。"""
+        original_cfg = dict(config._cfg)
+        original_app = dict(config.app)
+        try:
+            with TemporaryDirectory() as temp_dir:
+                config_path = Path(temp_dir) / "config.toml"
+                config_path.write_text("[app]\nold_value = true\n", encoding="utf-8")
+                config.app["replace_error_test"] = "not-saved"
+
+                with (
+                    patch.object(config, "root_dir", temp_dir),
+                    patch.object(config, "config_file", str(config_path)),
+                    patch.object(
+                        config.os,
+                        "replace",
+                        side_effect=OSError(errno.EACCES, "Permission denied"),
+                    ),
+                ):
+                    try:
+                        config.save_config()
+                    except OSError as exc:
+                        assert exc.errno == errno.EACCES
+                    else:
+                        raise AssertionError("expected config save to fail")
+
+                saved_config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+                assert saved_config["app"]["old_value"] is True
                 assert list(Path(temp_dir).glob(".config-*.toml.tmp")) == []
         finally:
             config.app.clear()
