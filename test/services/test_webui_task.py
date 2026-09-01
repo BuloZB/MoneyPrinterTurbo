@@ -1,10 +1,13 @@
 import ast
+import os
 import re
 import threading
 import time
+from collections.abc import Mapping
 from contextlib import nullcontext
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 from loguru import logger
@@ -30,6 +33,14 @@ def _attribute_name(node):
     return ".".join(reversed(names))
 
 
+def _log_record(file_path, message="generation finished"):
+    """构造 ``format_log_record`` 需要的最小 loguru 记录。"""
+    return {
+        "file": SimpleNamespace(name=os.path.basename(file_path), path=file_path),
+        "message": message,
+    }
+
+
 def test_generation_controls_submit_background_task_instead_of_blocking_page():
     """
     WebUI 生成按钮不能重新直接调用同步流水线。
@@ -52,6 +63,193 @@ def test_generation_controls_submit_background_task_instead_of_blocking_page():
 
     assert "webui_task.submit_generation" in calls
     assert "tm.start" not in calls
+
+
+def test_webui_runtime_config_updates_do_not_use_blocking_writes():
+    """
+    生成期间的普通控件 rerun 不能重新等待长任务持有的配置锁。
+
+    所有 WebUI 配置写入都必须经过非阻塞 helper；LLM 连接测试和语音试听可
+    使用 try lock 快速返回，但页面代码不能直接调用阻塞锁或阻塞保存函数。
+    """
+    tree = ast.parse(WEBUI_MAIN.read_text(encoding="utf-8"))
+    calls = {
+        _attribute_name(node.func)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+    }
+    assert "config.runtime_config_lock" not in calls
+    assert "config.save_config" not in calls
+    assert not calls.intersection(
+        {
+            "config.app.clear",
+            "config.app.pop",
+            "config.app.setdefault",
+            "config.app.update",
+            "config.azure.clear",
+            "config.azure.pop",
+            "config.azure.setdefault",
+            "config.azure.update",
+            "config.chatterbox.clear",
+            "config.chatterbox.pop",
+            "config.chatterbox.setdefault",
+            "config.chatterbox.update",
+            "config.elevenlabs.clear",
+            "config.elevenlabs.pop",
+            "config.elevenlabs.setdefault",
+            "config.elevenlabs.update",
+            "config.siliconflow.clear",
+            "config.siliconflow.pop",
+            "config.siliconflow.setdefault",
+            "config.siliconflow.update",
+            "config.ui.clear",
+            "config.ui.pop",
+            "config.ui.setdefault",
+            "config.ui.update",
+        }
+    )
+
+    synchronized_sections = {
+        "app",
+        "azure",
+        "chatterbox",
+        "elevenlabs",
+        "siliconflow",
+        "ui",
+    }
+    direct_writes = []
+    for node in ast.walk(tree):
+        targets = []
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        elif isinstance(node, ast.AugAssign):
+            targets = [node.target]
+
+        for target in targets:
+            if not isinstance(target, ast.Subscript):
+                continue
+            section = target.value
+            if (
+                isinstance(section, ast.Attribute)
+                and isinstance(section.value, ast.Name)
+                and section.value.id == "config"
+                and section.attr in synchronized_sections
+            ):
+                direct_writes.append(node.lineno)
+
+    assert direct_writes == []
+
+
+@pytest.mark.parametrize(
+    ("ui_config", "expected_open_count"),
+    [
+        ({}, 1),
+        ({"open_task_folder_on_completion": True}, 1),
+        ({"open_task_folder_on_completion": False}, 0),
+    ],
+)
+def test_completed_task_renders_subject_named_video_download(
+    tmp_path, ui_config, expected_open_count
+):
+    """完成任务应提供成片下载，并按 WebUI 配置决定是否自动打开目录。"""
+    tree = ast.parse(WEBUI_MAIN.read_text(encoding="utf-8"))
+    selected_nodes = []
+    target_names = {
+        "_DOWNLOAD_FILENAME_INVALID_PATTERN",
+        "_WINDOWS_RESERVED_FILENAMES",
+        "_build_video_download_name",
+        "_normalize_task_state",
+        "_render_generation_task_snapshot",
+    }
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id in target_names
+            for target in node.targets
+        ):
+            selected_nodes.append(node)
+        elif isinstance(node, ast.FunctionDef) and node.name in target_names:
+            selected_nodes.append(node)
+
+    class FakeColumn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class FakeStreamlit:
+        def __init__(self):
+            self.session_state = {}
+            self.downloads = []
+            self.videos = []
+
+        def columns(self, count):
+            return [FakeColumn() for _ in range(count)]
+
+        def video(self, video_path):
+            self.videos.append(video_path)
+
+        def download_button(self, label, data, **kwargs):
+            self.downloads.append((label, data.read(), kwargs))
+
+        def success(self, _message):
+            pass
+
+        def warning(self, _message):
+            pass
+
+        def error(self, _message):
+            pass
+
+    video_path = tmp_path / "final-1.mp4"
+    video_path.write_bytes(b"video-content")
+    fake_st = FakeStreamlit()
+    open_task_folder = MagicMock()
+    namespace = {
+        "Mapping": Mapping,
+        "config": SimpleNamespace(ui=ui_config),
+        "const": const,
+        "logger": MagicMock(),
+        "mimetypes": __import__("mimetypes"),
+        "open_task_folder": open_task_folder,
+        "os": os,
+        "re": re,
+        "st": fake_st,
+        "tr": lambda key: key,
+        "_render_generation_logs": lambda _task_id: None,
+    }
+    module = ast.fix_missing_locations(ast.Module(body=selected_nodes, type_ignores=[]))
+    exec(compile(module, str(WEBUI_MAIN), "exec"), namespace)
+
+    namespace["_render_generation_task_snapshot"](
+        "download-test",
+        {
+            "state": const.TASK_STATE_COMPLETE,
+            "progress": 100,
+            "videos": [str(video_path)],
+            "warnings": [],
+            "video_subject": "A day: in / Shanghai?",
+        },
+    )
+
+    assert fake_st.videos == [str(video_path)]
+    assert fake_st.downloads == [
+        (
+            "Download Video",
+            b"video-content",
+            {
+                "file_name": "A day in Shanghai.mp4",
+                "mime": "video/mp4",
+                "key": "download_generated_video_download-test_0",
+                "icon": ":material/download:",
+                "on_click": "ignore",
+                "use_container_width": True,
+            },
+        )
+    ]
+    assert open_task_folder.call_count == expected_open_count
+    if expected_open_count:
+        open_task_folder.assert_called_once_with("download-test")
 
 
 def test_submit_generation_returns_while_pipeline_is_still_running():
@@ -158,6 +356,59 @@ def test_worker_logs_are_available_without_streamlit_session_state():
     )
 
 
+def test_log_paths_stay_posix_style_on_every_platform():
+    """
+    调用位置必须始终显示为 ``./app/services/task.py``。
+
+    Windows 的 ``os.path.relpath`` 返回反斜杠分隔的路径，直接拼接会输出
+    ``./app\\services\\task.py``，同一份日志在不同系统上格式不一致，也无法
+    和上面按正斜杠断言的后台日志回归测试对齐。
+    """
+    record = _log_record(
+        os.path.join(logging_utils.PROJECT_ROOT, "app", "services", "task.py")
+    )
+
+    logging_utils.format_log_record(record)
+
+    assert record["file"].path == "./app/services/task.py"
+
+
+def test_log_paths_on_another_mount_do_not_discard_the_record():
+    """
+    映射盘或 ``subst`` 盘启动时不能让整条日志消失。
+
+    这种部署下调用栈里的路径仍在 ``X:``，而 ``PROJECT_ROOT`` 已被 realpath
+    解析回 ``C:``，``os.path.relpath`` 会抛出 ``ValueError``。loguru 捕获
+    格式化异常后会丢弃记录，终端和 WebUI 日志面板会同时变空。
+    """
+    absolute_path = os.path.join(
+        logging_utils.PROJECT_ROOT, "app", "services", "task.py"
+    )
+    record = _log_record(absolute_path)
+
+    with patch.object(
+        logging_utils.os.path,
+        "relpath",
+        side_effect=ValueError("path is on mount 'X:', start on mount 'C:'"),
+    ):
+        log_format = logging_utils.format_log_record(record)
+
+    assert log_format == logging_utils.LOG_RECORD_FORMAT
+    assert record["file"].path == absolute_path
+
+
+def test_log_paths_outside_the_project_keep_the_absolute_path():
+    """项目目录之外的文件保持绝对路径，避免输出 ``./../..`` 这类回溯路径。"""
+    outside_path = os.path.join(
+        os.path.dirname(logging_utils.PROJECT_ROOT), "site-packages", "worker.py"
+    )
+    record = _log_record(outside_path)
+
+    logging_utils.format_log_record(record)
+
+    assert record["file"].path == outside_path
+
+
 def test_generation_log_fragment_refreshes_within_half_a_second():
     """日志轮询间隔不能退回到明显落后于终端输出的秒级刷新。"""
     assert webui_task.TASK_LOG_REFRESH_INTERVAL_SECONDS <= 0.5
@@ -175,18 +426,16 @@ def test_generation_log_fragment_refreshes_within_half_a_second():
     run_every = next(
         keyword.value for keyword in decorator.keywords if keyword.arg == "run_every"
     )
-    assert ast.unparse(run_every) == (
-        "webui_task.TASK_LOG_REFRESH_INTERVAL_SECONDS"
-    )
+    assert ast.unparse(run_every) == ("webui_task.TASK_LOG_REFRESH_INTERVAL_SECONDS")
 
 
 def test_generation_submit_skips_duplicate_config_save():
     """
     提交任务后不能在页面末尾再次等待配置锁。
 
-    后台任务会在完整生成期间持有 runtime_config_lock。如果 Streamlit 主脚本
-    提交任务后再次调用 save_config，就可能阻塞到任务结束，使定时 Fragment
-    无法刷新日志。生成分支已经提前保存配置，页面末尾只处理普通交互。
+    后台任务会在完整生成期间持有 runtime_config_lock。生成分支已经请求过
+    非阻塞保存，页面末尾无需重复请求；普通交互则继续通过同一个非阻塞 helper
+    保存，不能重新退回 config.save_config。
     """
     tree = ast.parse(WEBUI_MAIN.read_text(encoding="utf-8"))
     controls = next(
@@ -209,8 +458,7 @@ def test_generation_submit_skips_duplicate_config_save():
         for node in application.body
         if isinstance(node, ast.Assign)
         and any(
-            isinstance(target, ast.Name)
-            and target.id == "generation_submitted"
+            isinstance(target, ast.Name) and target.id == "generation_submitted"
             for target in node.targets
         )
     )
@@ -230,7 +478,7 @@ def test_generation_submit_skips_duplicate_config_save():
         for node in ast.walk(guarded_save)
         if isinstance(node, ast.Call)
     }
-    assert guarded_calls == {"config.save_config"}
+    assert guarded_calls == {"_save_runtime_config"}
 
 
 def test_terminal_logger_reload_preserves_task_log_handler():
